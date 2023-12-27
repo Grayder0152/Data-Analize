@@ -1,16 +1,33 @@
+# Databricks notebook source
 from abc import ABC, abstractmethod
-
 from enum import Enum
 
 import numpy as np
+import pandas as pd
 import pyspark.sql.functions as f
 
-from pyspark.ml.feature import VectorAssembler
 from pyspark.ml.functions import array_to_vector
 
-from pyspark.sql import SparkSession
+from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql.types import ArrayType, DoubleType
 
+# COMMAND ----------
+
+@f.udf(returnType=ArrayType(DoubleType()))
+def calc_centroids(vectors):
+    np_vectors = np.array([v.toArray() for v in vectors])
+    centroid = np.mean(np_vectors, axis=0)
+    return centroid.tolist()
+
+
+@f.udf(returnType=DoubleType())
+def sum_of_distances_to_centroid(vectors, centroid):
+    centroid = np.array(centroid)
+    points = np.array([v.toArray() for v in vectors])
+    distances = np.sqrt(((points - centroid) ** 2).sum(axis=1))
+    return float(distances.sum())
+
+# COMMAND ----------
 
 class LinkageMethodName(Enum):
     ward: str = 'ward'
@@ -22,83 +39,31 @@ class LinkageMethod(ABC):
     def name(self):
         pass
 
+# COMMAND ----------
 
 class WardLinkage(LinkageMethod):
     name = LinkageMethodName.ward
 
-    def linkage(self, data):
-        pass
-
-
-if __name__ == '__main__':
-    import time
-
-    spark = (
-        SparkSession.builder.master("local[*]")
-        .appName("K-mean")
-        .config("spark.sql.execution.arrow.pyspark.enabled", True)
-        .getOrCreate()
-    )
-
-    assembler = VectorAssembler(inputCols=['t32', 't33'], outputCol="features")
-    data = (
-        spark.read.csv('../../data/data.csv', header=True, inferSchema=True)
-        .withColumnRenamed('Напряжение углекислого газа (PCO2)', 'cluster_id')
-    )
-    data = assembler.transform(data).select('cluster_id', 'features')
-    data = data.limit(20).groupBy('cluster_id').agg(f.collect_list('features').alias('points'))
-
-
-    @f.udf(returnType=ArrayType(DoubleType()))
-    def calc_centroids(vectors):
-        np_vectors = np.array([v.toArray() for v in vectors])
-        centroid = np.mean(np_vectors, axis=0)
-        return centroid.tolist()
-
-
-    @f.udf(returnType=DoubleType())
-    def sum_of_distances_to_centroid(vectors, centroid):
-        centroid = np.array(centroid)
-        points = np.array([v.toArray() for v in vectors])
-        distances = np.sqrt(((points - centroid) ** 2).sum(axis=1))
-        return float(distances.sum())
-
-
-    i = data.count()
-    while i != 3:
-        print(f"{i} iteration")
-        start = time.time()
-        cached_data = data.cache()
-        cached_data = cached_data.withColumn('centroid', calc_centroids('points'))
-        cached_data = cached_data.withColumn('dist', sum_of_distances_to_centroid('points', 'centroid'))
-
-        df1 = cached_data.select(f.col('cluster_id').alias('cluster_id_1'), f.col('points').alias('points_1'),
-                                 f.col('dist'))
-        df2 = cached_data.select(f.col('cluster_id').alias('cluster_id_2'), f.col('points').alias('points_2'))
-
-        df = (
-            df1
-            .join(df2, f.col('cluster_id_1') != f.col('cluster_id_2'), 'cross')
-            .withColumn("sorted_ids", f.array_sort(f.array(f.col("cluster_id_1"), f.col("cluster_id_2"))))
-            .dropDuplicates(["sorted_ids"])
-            .withColumn('points', f.concat('points_1', 'points_2'))
-            .withColumn('centroid', calc_centroids('points'))
-            .withColumn('new_dist', sum_of_distances_to_centroid('points', 'centroid'))
-            .withColumn('diff', f.col('new_dist') - f.col('dist'))
-            .orderBy('diff')
-        )
-        new_centroid = df.select('cluster_id_1', 'cluster_id_2', 'points').first()
-        min_cluster_id, max_cluster_id = sorted([new_centroid.cluster_id_1, new_centroid.cluster_id_2])
-        new_points = f.array(*[array_to_vector(f.lit(vector.toArray())) for vector in new_centroid.points])
-        data = (
-            data
-            .where(f.col('cluster_id') != max_cluster_id)
-            .withColumn('points', f.when(
-                f.col('cluster_id') == min_cluster_id, new_points
-            ).otherwise(f.col('points')))
-        )
-
-        cached_data.unpersist()
-        i -= 1
-        print(time.time() - start)
-
+    def linkage(self, data: pd.DataFrame, k: int = 0) -> DataFrame:
+        max_iteration = len(data)
+        while max_iteration != k:
+            df = data.assign(
+                dist=lambda x: [((p - np.mean(p, axis=0)) ** 2).sum(axis=0).sum() for p in data.points]
+            )
+            df = pd.merge(df, df, how='cross', suffixes=('_1', '_2'))
+            df = df[df.cluster_id_1 != df.cluster_id_2]
+            df['sorted_tuple'] = df.apply(lambda row: tuple(sorted((row['cluster_id_1'], row['cluster_id_2']))), axis=1)
+            df = df.drop_duplicates(subset='sorted_tuple').drop(columns='sorted_tuple')
+            df['points'] = df.apply(lambda row: [*row['points_1'], *row['points_2']], axis=1)
+            df = df.assign(
+                new_dist=lambda x: [((p - np.mean(p, axis=0)) ** 2).sum(axis=0).sum() for p in df.points],
+            )
+            # df['diff'] = df['new_dist'] - df['dist']
+            df['diff'] = df['new_dist'] - df['dist_1'] - df['dist_2']
+            new_centroid = df.loc[df['diff'].idxmin()][['cluster_id_1', 'cluster_id_2', 'points']]
+            min_cluster_id, max_cluster_id = sorted([new_centroid.cluster_id_1, new_centroid.cluster_id_2])
+            data.loc[data['cluster_id'] == min_cluster_id, 'points'] = pd.Series([new_centroid.points], index=data[
+                data['cluster_id'] == min_cluster_id].index.values)
+            data = data[data['cluster_id'] != max_cluster_id]
+            max_iteration -= 1
+        return data
